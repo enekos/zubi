@@ -6,7 +6,7 @@ rust-version = "1.88"
 authors = ["Eneko Sarasola"]
 description = "Front door for local dev servers: one binary that starts them, knows when they are ready and proxies them on one port"
 license = "MIT"
-repository = "https://github.com/enekosarasola/zubi"
+repository = "https://github.com/enekos/zubi"
 keywords = ["dev-server", "proxy", "supervisor", "monorepo"]
 categories = ["development-tools", "command-line-utilities"]
 

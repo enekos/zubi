@@ -350,7 +350,7 @@ pub fn validate(config: &Config) -> Result<()> {
     Ok(())
 }
 
-pub const EXAMPLE: &str = r#"# zubi — one front door for your dev servers. Docs: https://github.com/enekosarasola/zubi
+pub const EXAMPLE: &str = r#"# zubi — one front door for your dev servers. Docs: https://github.com/enekos/zubi
 
 [proxy]
 port = 8000                 # everything is served from http://localhost:8000
