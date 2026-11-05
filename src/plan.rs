@@ -165,9 +165,11 @@ fn proxy_config(
         .parse()
         .with_context(|| format!("proxy.bind {:?} is not an IP address", config.proxy.bind))?;
     let listen = std::net::SocketAddr::new(bind, config.proxy.port);
-    let base: http::Uri = format!("http://localhost:{}", config.proxy.port)
-        .parse()
-        .context("proxy base url")?;
+    let base: http::Uri = match &config.proxy.public_url {
+        Some(url) => url.trim_end_matches('/').parse(),
+        None => format!("http://localhost:{}", config.proxy.port).parse(),
+    }
+    .context("proxy base url")?;
     let mut targets = HashMap::with_capacity(config.services.len() + config.upstreams.len());
     for (name, service) in &config.services {
         let Some(port) = effective_port(name, service) else {
@@ -202,6 +204,7 @@ fn proxy_config(
                     host,
                     rewrite_cookies: upstream.rewrite_cookies,
                     rewrite_redirects: upstream.rewrite_redirects,
+                    headers: upstream_headers(name, &upstream.headers)?,
                 },
                 header_timeout: (upstream.timeout_secs > 0)
                     .then(|| Duration::from_secs(upstream.timeout_secs)),
@@ -214,7 +217,26 @@ fn proxy_config(
         base,
         targets,
         router,
+        cors_origins: config.proxy.cors_origins.clone(),
+        strip_cookie_domains: config.proxy.strip_cookie_domains,
     })
+}
+
+fn upstream_headers(
+    name: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<(http::header::HeaderName, http::header::HeaderValue)>> {
+    headers
+        .iter()
+        .map(|(header, value)| {
+            let header = http::header::HeaderName::from_bytes(header.as_bytes())
+                .with_context(|| format!("upstream {name}: header name {header:?}"))?;
+            let mut value = http::header::HeaderValue::from_str(value)
+                .with_context(|| format!("upstream {name}: value of header {header}"))?;
+            value.set_sensitive(true);
+            Ok((header, value))
+        })
+        .collect()
 }
 
 fn launch_for(

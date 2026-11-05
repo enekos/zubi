@@ -33,6 +33,7 @@ pub enum TargetKind {
         host: String,
         rewrite_cookies: bool,
         rewrite_redirects: bool,
+        headers: Vec<(HeaderName, HeaderValue)>,
     },
 }
 
@@ -49,6 +50,8 @@ pub struct ProxyConfig {
     pub base: Uri,
     pub targets: HashMap<String, Target>,
     pub router: Router,
+    pub cors_origins: Vec<String>,
+    pub strip_cookie_domains: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -184,6 +187,50 @@ impl Proxy {
             .get(header::ACCEPT)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|a| a.contains("text/html"));
+        let cors = (!self.cfg.cors_origins.is_empty()).then(|| self.allowed_origin(req.headers()));
+        if let Some(origin) = &cors
+            && method == Method::OPTIONS
+        {
+            let mut resp = body::text(StatusCode::NO_CONTENT, String::new());
+            apply_cors(resp.headers_mut(), origin.as_ref());
+            self.log
+                .line("proxy", &format!("{method} {path_and_query} => [cors] 204"));
+            return resp;
+        }
+        let mut resp = self
+            .respond(req, &method, &path_and_query, wants_html, started)
+            .await;
+        if let Some(origin) = &cors {
+            apply_cors(resp.headers_mut(), origin.as_ref());
+        }
+        resp
+    }
+
+    fn allowed_origin(&self, headers: &HeaderMap) -> Option<HeaderValue> {
+        let origin = headers.get(header::ORIGIN)?;
+        let host = origin
+            .to_str()
+            .ok()?
+            .parse::<Uri>()
+            .ok()?
+            .authority()?
+            .as_str()
+            .to_ascii_lowercase();
+        self.cfg
+            .cors_origins
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(&host))
+            .then(|| origin.clone())
+    }
+
+    async fn respond(
+        &self,
+        req: Request<Incoming>,
+        method: &Method,
+        path_and_query: &str,
+        wants_html: bool,
+        started: Instant,
+    ) -> Response<Body> {
         match self.route(req).await {
             Ok((label, resp)) => {
                 self.log.line(
@@ -204,7 +251,7 @@ impl Proxy {
                         err.status().as_u16()
                     ),
                 );
-                self.error_response(&err, wants_html && method == Method::GET)
+                self.error_response(&err, wants_html && *method == Method::GET)
             }
         }
     }
@@ -228,7 +275,11 @@ impl Proxy {
                 .router
                 .resolve(host, &referer)
                 .map(|m| match m {
-                    Matched::Forward { to, .. } => Matched::Forward { to, strip: 0 },
+                    Matched::Forward { to, .. } => Matched::Forward {
+                        to,
+                        strip: 0,
+                        keep_prefix_on_upgrade: false,
+                    },
                     fixed @ Matched::Status(_) => fixed,
                 })
                 .or_else(|| self.cfg.router.resolve(host, path)),
@@ -264,10 +315,11 @@ impl Proxy {
             Matched::Status(_) => String::new(),
         };
         let target = target.clone();
-        let forward = forward_path_and_query(req.uri(), matched)?;
         if is_upgrade(req.headers()) {
+            let forward = forward_path_and_query(req.uri(), matched.for_upgrade())?;
             return self.upgrade(req, &key, &target, forward).await;
         }
+        let forward = forward_path_and_query(req.uri(), matched)?;
 
         let (parts, body) = req.into_parts();
         let (body, operation) = if is_graphql_json_post(&parts.method, &path, &parts.headers) {
@@ -308,6 +360,7 @@ impl Proxy {
             .body(body)
             .map_err(|e| anyhow!("building upstream request: {e}"))?;
         copy_request_headers(&parts.headers, upstream.headers_mut(), &target.uri);
+        set_upstream_headers(upstream.headers_mut(), target);
 
         let fut = self.client.request(upstream);
         let resp = match target.header_timeout {
@@ -342,12 +395,23 @@ impl Proxy {
                 host,
                 rewrite_cookies,
                 rewrite_redirects,
+                ..
             } => (host.as_str(), *rewrite_cookies, *rewrite_redirects),
             TargetKind::Service => ("", false, false),
         };
         let strip_secure = self.cfg.base.scheme() != Some(&Scheme::HTTPS);
+        let cors = !self.cfg.cors_origins.is_empty();
         for (name, value) in from {
-            if is_hop_by_hop(name) {
+            if is_hop_by_hop(name) || (cors && name == header::ACCESS_CONTROL_ALLOW_ORIGIN) {
+                continue;
+            }
+            if self.cfg.strip_cookie_domains
+                && name == header::SET_COOKIE
+                && let Ok(cookie) = value.to_str()
+                && let Ok(rewritten) =
+                    HeaderValue::from_str(&strip_set_cookie_domain(cookie, strip_secure))
+            {
+                to.append(name.clone(), rewritten);
                 continue;
             }
             if cookies
@@ -419,6 +483,7 @@ impl Proxy {
             up_req.headers_mut().append(name.clone(), value.clone());
         }
         up_req.headers_mut().insert(header::HOST, host_header(uri)?);
+        set_upstream_headers(up_req.headers_mut(), target);
 
         let mut resp = sender
             .send_request(up_req)
@@ -514,6 +579,46 @@ fn is_upgrade(headers: &HeaderMap) -> bool {
             .get(header::CONNECTION)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|c| c.to_ascii_lowercase().contains("upgrade"))
+}
+
+const CORS_METHODS: &str = "GET,POST,PUT,PATCH,DELETE,OPTIONS";
+const CORS_HEADERS: &str = "Content-Type, Authorization, baggage, sentry-trace";
+
+fn apply_cors(headers: &mut HeaderMap, origin: Option<&HeaderValue>) {
+    headers.remove(header::ACCESS_CONTROL_ALLOW_ORIGIN);
+    let Some(origin) = origin else {
+        return;
+    };
+    headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_CREDENTIALS,
+        HeaderValue::from_static("true"),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static(CORS_METHODS),
+    );
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static(CORS_HEADERS),
+    );
+    let varies_by_origin = headers.get_all(header::VARY).iter().any(|v| {
+        v.to_str().is_ok_and(|v| {
+            v.split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("origin"))
+        })
+    });
+    if !varies_by_origin {
+        headers.append(header::VARY, HeaderValue::from_static("Origin"));
+    }
+}
+
+fn set_upstream_headers(headers: &mut HeaderMap, target: &Target) {
+    if let TargetKind::Upstream { headers: extra, .. } = &target.kind {
+        for (name, value) in extra {
+            headers.insert(name.clone(), value.clone());
+        }
+    }
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
@@ -620,9 +725,26 @@ fn copy_request_headers(from: &HeaderMap, to: &mut HeaderMap, target: &Uri) {
 }
 
 pub fn rewrite_set_cookie(cookie: &str, upstream_host: &str, strip_secure: bool) -> String {
+    let dotted = format!(".{upstream_host}");
+    rewrite_cookie_attrs(cookie, strip_secure, |domain| {
+        domain.eq_ignore_ascii_case(".localhost")
+            || domain.eq_ignore_ascii_case("localhost")
+            || domain.eq_ignore_ascii_case(&dotted)
+            || domain.eq_ignore_ascii_case(upstream_host)
+    })
+}
+
+pub fn strip_set_cookie_domain(cookie: &str, strip_secure: bool) -> String {
+    rewrite_cookie_attrs(cookie, strip_secure, |_| true)
+}
+
+fn rewrite_cookie_attrs(
+    cookie: &str,
+    strip_secure: bool,
+    drop_domain: impl Fn(&str) -> bool,
+) -> String {
     let mut attrs = cookie.split(';');
     let mut out = attrs.next().unwrap_or("").trim().to_owned();
-    let dotted = format!(".{upstream_host}");
     for attr in attrs {
         let attr = attr.trim();
         if attr.is_empty() {
@@ -631,12 +753,7 @@ pub fn rewrite_set_cookie(cookie: &str, upstream_host: &str, strip_secure: bool)
         let (name, value) = attr
             .split_once('=')
             .map_or((attr, ""), |(n, v)| (n.trim(), v.trim()));
-        if name.eq_ignore_ascii_case("domain")
-            && (value.eq_ignore_ascii_case(".localhost")
-                || value.eq_ignore_ascii_case("localhost")
-                || value.eq_ignore_ascii_case(&dotted)
-                || value.eq_ignore_ascii_case(upstream_host))
-        {
+        if name.eq_ignore_ascii_case("domain") && drop_domain(value) {
             continue;
         }
         if strip_secure && name.eq_ignore_ascii_case("secure") {
@@ -693,6 +810,72 @@ mod tests {
             rewrite_set_cookie("sid=1; Domain=.localhost; Secure", "api.example.com", true),
             "sid=1"
         );
+    }
+
+    #[test]
+    fn stripping_cookie_domains_drops_every_domain() {
+        assert_eq!(
+            strip_set_cookie_domain("sid=1; Domain=web-abc123.localhost; Path=/; Secure", true),
+            "sid=1; Path=/"
+        );
+        assert_eq!(
+            strip_set_cookie_domain("sid=1; domain=.join.com; Secure", false),
+            "sid=1; Secure"
+        );
+    }
+
+    #[test]
+    fn cors_reflects_the_origin_and_replaces_the_upstream_wildcard() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        );
+        headers.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+        let origin = HeaderValue::from_static("http://web-abc123.localhost:8001");
+        apply_cors(&mut headers, Some(&origin));
+        assert_eq!(
+            headers.get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&origin)
+        );
+        assert_eq!(
+            headers
+                .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .unwrap(),
+            "true"
+        );
+        assert_eq!(headers.get_all(header::VARY).iter().count(), 2);
+        apply_cors(&mut headers, Some(&origin));
+        assert_eq!(headers.get_all(header::VARY).iter().count(), 2);
+
+        let mut denied = HeaderMap::new();
+        denied.insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        );
+        apply_cors(&mut denied, None);
+        assert!(denied.get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none());
+    }
+
+    #[test]
+    fn upstream_headers_override_the_client() {
+        let mut value = HeaderValue::from_static("secret");
+        value.set_sensitive(true);
+        let target = Target {
+            uri: "https://api.example.com".parse().unwrap(),
+            kind: TargetKind::Upstream {
+                host: "api.example.com".into(),
+                rewrite_cookies: false,
+                rewrite_redirects: false,
+                headers: vec![(HeaderName::from_static("x-token"), value)],
+            },
+            header_timeout: None,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-token", HeaderValue::from_static("from-browser"));
+        set_upstream_headers(&mut headers, &target);
+        assert_eq!(headers.get("x-token").unwrap(), "secret");
+        assert!(!format!("{target:?}").contains("secret"));
     }
 
     #[test]
@@ -761,6 +944,7 @@ mod tests {
             Matched::Forward {
                 to: "docs",
                 strip: 5,
+                keep_prefix_on_upgrade: false,
             },
         )
         .unwrap();
@@ -770,6 +954,7 @@ mod tests {
             Matched::Forward {
                 to: "docs",
                 strip: 0,
+                keep_prefix_on_upgrade: false,
             },
         )
         .unwrap();

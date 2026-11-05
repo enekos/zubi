@@ -34,6 +34,12 @@ pub struct ProxySection {
     pub autostart: bool,
     #[serde(default)]
     pub route_by_referer: Vec<String>,
+    #[serde(default)]
+    pub public_url: Option<String>,
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
+    #[serde(default)]
+    pub strip_cookie_domains: bool,
 }
 
 impl Default for ProxySection {
@@ -43,6 +49,9 @@ impl Default for ProxySection {
             bind: default_bind(),
             autostart: true,
             route_by_referer: Vec::new(),
+            public_url: None,
+            cors_origins: Vec::new(),
+            strip_cookie_domains: false,
         }
     }
 }
@@ -110,6 +119,8 @@ pub struct UpstreamSection {
     pub rewrite_redirects: bool,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -125,6 +136,8 @@ pub struct RouteSection {
     pub regex: Option<String>,
     #[serde(default)]
     pub strip: bool,
+    #[serde(default)]
+    pub keep_prefix_on_upgrade: bool,
     #[serde(default)]
     pub to: Option<String>,
     #[serde(default)]
@@ -295,6 +308,12 @@ pub fn validate(config: &Config) -> Result<()> {
                 upstream.url
             );
         }
+        for (header, value) in &upstream.headers {
+            http::header::HeaderName::from_bytes(header.as_bytes())
+                .with_context(|| format!("upstream {name:?}: header name {header:?}"))?;
+            http::header::HeaderValue::from_str(value)
+                .with_context(|| format!("upstream {name:?}: value of header {header:?}"))?;
+        }
     }
     for (index, route) in config.routes.iter().enumerate() {
         let matchers = [
@@ -318,6 +337,9 @@ pub fn validate(config: &Config) -> Result<()> {
         }
         if route.strip && route.exact.is_none() && route.prefix.is_none() {
             bail!("route {index}: strip needs an exact or prefix matcher");
+        }
+        if route.keep_prefix_on_upgrade && !route.strip {
+            bail!("route {index}: keep_prefix_on_upgrade only makes sense with strip");
         }
         match (&route.to, route.status) {
             (Some(_), Some(_)) | (None, None) => {
@@ -347,6 +369,19 @@ pub fn validate(config: &Config) -> Result<()> {
             bail!("proxy.route_by_referer entry {prefix:?} must start with /");
         }
     }
+    if let Some(url) = &config.proxy.public_url {
+        let uri: http::Uri = url
+            .parse()
+            .with_context(|| format!("proxy.public_url {url:?}"))?;
+        if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.host().is_none() {
+            bail!("proxy.public_url {url:?} needs an http(s) scheme and a host");
+        }
+    }
+    for origin in &config.proxy.cors_origins {
+        if origin.is_empty() || origin.contains('/') {
+            bail!("proxy.cors_origins entry {origin:?} must be a host[:port], without a scheme");
+        }
+    }
     Ok(())
 }
 
@@ -356,6 +391,9 @@ pub const EXAMPLE: &str = r#"# zubi — one front door for your dev servers. Doc
 port = 8000                 # everything is served from http://localhost:8000
 # bind = "0.0.0.0"          # to reach it from a phone on the same network
 # route_by_referer = ["/__nextjs"]   # dev-overlay paths shared by several apps of one framework
+# public_url = "http://web.localhost:8000"   # the origin the browser uses, when it is not localhost
+# cors_origins = ["web.localhost:8000"]      # reflect these Origin hosts, with credentials
+# strip_cookie_domains = true                # drop Domain= from every Set-Cookie, services included
 
 [services.web]
 dir = "."                   # relative to this file
@@ -373,6 +411,7 @@ port = 3000
 # rewrite_cookies = true    # drop Domain=, strip Secure on http
 # rewrite_redirects = true  # Location: https://api.staging.example.com/x -> http://localhost:8000/x
 # timeout_secs = 0          # 0 = never time out waiting for headers (SSE, long polls)
+# headers = { "x-api-key" = "dev" }   # set on every request forwarded to this upstream
 
 # Routes are tried in order; the first match wins. A route without a matcher matches everything.
 # [[routes]]
@@ -382,6 +421,7 @@ port = 3000
 # prefix = "/docs"
 # to = "docs"
 # strip = true             # forward /docs/x as /x
+# keep_prefix_on_upgrade = true   # but forward websocket upgrades with the prefix
 # [[routes]]
 # regex = "^/locales/.*/en\\.json$"
 # status = 404             # answer without forwarding
@@ -455,5 +495,32 @@ mod tests {
         );
         assert!(parse("[services.a]\ncmd = \"x\"\nready = \"soon\"\n").is_err());
         assert!(parse("[services.a]\ncmd = \"x\"\nready = { http = \"/x\" }\n").is_err());
+    }
+
+    #[test]
+    fn proxy_extensions_are_validated() {
+        let config = parse(
+            "[proxy]\npublic_url = \"http://web.localhost:8001\"\ncors_origins = [\"web.localhost:8001\"]\nstrip_cookie_domains = true\n[upstreams.api]\nurl = \"https://api.example.com\"\nheaders = { \"x-token\" = \"t\" }\n[[routes]]\nprefix = \"/__app/api/\"\nstrip = true\nkeep_prefix_on_upgrade = true\nto = \"api\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.proxy.public_url.as_deref(),
+            Some("http://web.localhost:8001")
+        );
+        assert!(config.proxy.strip_cookie_domains);
+        assert_eq!(config.upstreams["api"].headers["x-token"], "t");
+        assert!(config.routes[0].keep_prefix_on_upgrade);
+        assert!(parse("[proxy]\npublic_url = \"web.localhost\"\n").is_err());
+        assert!(parse("[proxy]\ncors_origins = [\"http://web.localhost\"]\n").is_err());
+        assert!(
+            parse("[upstreams.api]\nurl = \"https://a.example\"\nheaders = { \"bad header\" = \"x\" }\n")
+                .is_err()
+        );
+        let err = parse(
+            "[upstreams.api]\nurl = \"https://a.example\"\n[[routes]]\nprefix = \"/a\"\nkeep_prefix_on_upgrade = true\nto = \"api\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("only makes sense with strip"), "{err}");
     }
 }
