@@ -53,6 +53,10 @@ zubi up                       # proxy + every autostart service, logs interleave
 port = 8000
 # bind = "0.0.0.0"                    # default 127.0.0.1
 # route_by_referer = ["/__nextjs"]    # dev-overlay paths shared by several apps of one framework
+# public_url = "http://web.localhost:8000"   # the origin the browser uses: redirects, Secure, --open
+# cors_origins = ["web.localhost:8000"]      # reflect these Origin hosts with credentials;
+#                                            # preflights answer 204, upstream Allow-Origin is dropped
+# strip_cookie_domains = true                # drop Domain= from every Set-Cookie, services included
 
 [services.web]
 dir = "apps/web"                      # relative to this file
@@ -73,6 +77,7 @@ url = "https://api.staging.example.com"
 rewrite_cookies = true
 rewrite_redirects = true
 # timeout_secs = 120                  # 0 = never time out waiting for headers
+# headers = { "x-api-key" = "dev" }   # set on every request to this upstream; never logged
 
 # first match wins; a route with no matcher matches everything
 [[routes]]
@@ -85,6 +90,7 @@ to = "auth"
 prefix = "/docs"
 to = "docs"
 strip = true                          # forward /docs/x as /x
+# keep_prefix_on_upgrade = true       # but forward websocket upgrades unstripped
 [[routes]]
 regex = "^/locales/.*/en\\.json$"
 status = 404                          # answer without forwarding

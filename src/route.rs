@@ -33,7 +33,11 @@ impl Matcher {
 
 #[derive(Debug, Clone)]
 enum Answer {
-    Forward { to: String, strip: bool },
+    Forward {
+        to: String,
+        strip: bool,
+        keep_prefix_on_upgrade: bool,
+    },
     Status(u16),
 }
 
@@ -46,11 +50,31 @@ struct Rule {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Matched<'a> {
-    Forward { to: &'a str, strip: usize },
+    Forward {
+        to: &'a str,
+        strip: usize,
+        keep_prefix_on_upgrade: bool,
+    },
     Status(u16),
 }
 
 impl Matched<'_> {
+    #[must_use]
+    pub fn for_upgrade(self) -> Self {
+        match self {
+            Matched::Forward {
+                to,
+                keep_prefix_on_upgrade: true,
+                ..
+            } => Matched::Forward {
+                to,
+                strip: 0,
+                keep_prefix_on_upgrade: true,
+            },
+            other => other,
+        }
+    }
+
     pub fn strip(&self) -> usize {
         match self {
             Matched::Forward { strip, .. } => *strip,
@@ -94,6 +118,7 @@ impl Router {
                 (Some(to), _) => Answer::Forward {
                     to: to.clone(),
                     strip: route.strip,
+                    keep_prefix_on_upgrade: route.keep_prefix_on_upgrade,
                 },
                 (None, Some(status)) => Answer::Status(status),
                 (None, None) => anyhow::bail!("route {index}: needs to or status"),
@@ -121,12 +146,17 @@ impl Router {
                     && rule.matcher.hits(path)
             })
             .map(|rule| match &rule.answer {
-                Answer::Forward { to, strip } => Matched::Forward {
+                Answer::Forward {
+                    to,
+                    strip,
+                    keep_prefix_on_upgrade,
+                } => Matched::Forward {
                     to: to.as_str(),
                     strip: match (&rule.matcher, strip) {
                         (Matcher::Exact(p) | Matcher::Prefix(p), true) => p.len(),
                         _ => 0,
                     },
+                    keep_prefix_on_upgrade: *keep_prefix_on_upgrade,
                 },
                 Answer::Status(status) => Matched::Status(*status),
             })
@@ -156,8 +186,17 @@ impl Router {
                     m = format!("{h} {m}");
                 }
                 let answer = match &rule.answer {
-                    Answer::Forward { to, strip: true } => format!("{to} (strip)"),
-                    Answer::Forward { to, strip: false } => to.clone(),
+                    Answer::Forward {
+                        to,
+                        strip: true,
+                        keep_prefix_on_upgrade: true,
+                    } => format!("{to} (strip, not on upgrade)"),
+                    Answer::Forward {
+                        to, strip: true, ..
+                    } => format!("{to} (strip)"),
+                    Answer::Forward {
+                        to, strip: false, ..
+                    } => to.clone(),
                     Answer::Status(status) => format!("answer {status}"),
                 };
                 (m, answer)
@@ -259,9 +298,11 @@ mod tests {
             m,
             Matched::Forward {
                 to: "docs",
-                strip: 5
+                strip: 5,
+                keep_prefix_on_upgrade: false
             }
         );
+        assert_eq!(m.for_upgrade(), m);
         assert_eq!(m.forward_path("/docs/guide"), "/guide");
         assert_eq!(r.resolve(None, "/docs").unwrap().forward_path("/docs"), "/");
         assert_eq!(
@@ -272,6 +313,28 @@ mod tests {
         assert_eq!(
             r.describe().first().map(|d| (d.0.as_str(), d.1.as_str())),
             Some(("/docs*", "docs (strip)"))
+        );
+    }
+
+    #[test]
+    fn upgrades_can_keep_the_stripped_prefix() {
+        let r = Router::build(
+            &[RouteSection {
+                prefix: Some("/__app/web/".into()),
+                strip: true,
+                keep_prefix_on_upgrade: true,
+                ..route("web")
+            }],
+            &[],
+        )
+        .unwrap();
+        let path = "/__app/web/webpack-hmr";
+        let m = r.resolve(None, path).unwrap();
+        assert_eq!(m.forward_path(path), "/webpack-hmr");
+        assert_eq!(m.for_upgrade().forward_path(path), path);
+        assert_eq!(
+            r.describe().first().map(|d| d.1.as_str()),
+            Some("web (strip, not on upgrade)")
         );
     }
 
